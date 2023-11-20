@@ -1,0 +1,756 @@
+---
+title: "Lab-final-Murtos"
+author: "Jiaqi Murtos"
+date: "2023-11-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library( knitr )
+library( pander )
+library( stargazer )
+library( scales )
+library( pals)         # color scales
+library( geojsonio )   # read shapefiles
+library( sp )          # work with shapefiles
+library( sf )          # work with shapefiles - simple features format
+library( mclust )      # cluster analysis 
+library( tmap )        # theme maps
+library( ggplot2 )     # graphing 
+library( ggthemes )    # nice formats for ggplots
+library( dplyr )       # data wrangling 
+library( pander )      # formatting RMD tables
+library( tidycensus )
+
+library( cartogram )  # spatial maps w/ tract size bias reduction
+library( corrplot )
+
+set.seed( 1234 )
+
+# set stargazer type to text for 
+# previewing in RMD docs but
+# convert to type HTML when knitting
+# (next code chunk)
+
+s.type <- "text"
+```
+
+
+```{r}
+crosswalk <- read.csv( "https://raw.githubusercontent.com/DS4PS/cpp-529-master/master/data/cbsatocountycrosswalk.csv",  stringsAsFactors=F, colClasses="character" )
+
+# search for citie names by strings, use the ^ anchor for "begins with" 
+
+grep( "^MER", crosswalk$msaname, value=TRUE ) 
+
+these.msp <- crosswalk$msaname == "MERCED, CA"
+these.fips <- crosswalk$fipscounty[ these.msp ]
+these.fips <- na.omit( these.fips )
+
+head( these.fips ) %>% pander()
+state.fips <- substr( these.fips, 1, 2 )
+county.fips <- substr( these.fips, 3, 5 )
+
+cbind( these.fips, state.fips, county.fips ) %>% pander()
+
+merced.pop <-
+get_acs( geography = "tract", variables = "B01003_001",
+         state = "06", county = county.fips[state.fips=="06"], geometry = TRUE ) %>% 
+         select( GEOID, estimate ) %>%
+         rename( POP=estimate )
+
+
+URL <- "https://github.com/DS4PS/cpp-529-master/raw/master/data/ltdb_std_2010_sample.rds"
+census.dat <- readRDS(gzcon(url( URL )))
+
+merced.pop$GEOID<-sub( ".","", merced.pop$GEOID ) #Remove first 0 on GEOID to match trackid in Census_dat
+
+# Merge Merced pop data with the census data
+msp <- merge( merced.pop, census.dat, by.x="GEOID", by.y="tractid" )
+
+# make sure there are no empty polygons
+msp <- msp[ ! st_is_empty( msp ) , ]
+# convert sf map object to an sp version
+msp.sp <- as_Spatial( msp )
+
+class( msp.sp )
+plot(msp.sp)
+```
+
+```{r}
+# project map and remove empty tracts
+msp.sp <- spTransform( msp.sp, CRS("+init=epsg:2227"))
+msp.sp <- msp.sp[ msp.sp$POP != 0 & (! is.na( msp.sp$POP )) , ]
+
+# convert census tract polygons to dorling cartogram
+# no idea why k=0.03 works, but it does - default is k=5
+msp.sp$pop.w <- msp.sp$POP / 1000 # max(msp.sp$POP)   # standardizes it to max of 1.5
+msp_dorling <- cartogram_dorling( x=msp.sp, weight="pop.w", k=0.3 )
+plot( msp_dorling )
+```
+
+```{r}
+tm_shape( msp_dorling ) + 
+  tm_polygons( size="POP", col="hinc12", n=7, style="quantile", palette="Spectral" ) +
+  tm_layout( "Dorling Cartogram \nof Household Income \nfor Merced", 
+              title.position=c( "right","top" ) )
+```
+
+```{r, echo=TRUE}
+## xmin: -121.2485 ymin: 36.74038 xmax: -120.0521 ymax: 37.63336
+st_as_sf(msp)
+```
+```{r}
+# Set bounding box coordinates, output Dorling Cartogram visualization 
+bb <- st_bbox( c( xmin = -121.2485, xmax = -120.0521, 
+                  ymax = 37.63336, ymin = 36.74038 ), 
+                crs = 4269) 
+
+tm_shape( msp_dorling, bbox=bb ) + 
+  tm_polygons( col="hinc12", n=10, style="quantile", palette="Spectral" ) +
+  tm_layout( "Dorling Cartogram", title.position=c("right","top") )
+```
+## Clustering. Data is transformed into z-score to ensure they are all on similar scales. Z-scores typically range from about -3 to +3 with a mean of zero. 
+```{r}
+keep.these <- c("pnhwht12", "pnhblk12", "phisp12", "pntv12", "pfb12", "polang12", 
+"phs12", "pcol12", "punemp12", "pflabf12", "pprof12", "pmanuf12", 
+"pvet12", "psemp12", "hinc12", "incpc12", "ppov12", "pown12", 
+"pvac12", "pmulti12", "mrent12", "mhmval12", "p30old12", "p10yrs12", 
+"p18und12", "p60up12", "p75up12", "pmar12", "pwds12", "pfhh12")
+
+d1 <- msp_dorling@data
+d2 <- select( d1, keep.these )
+d3 <- apply( d2, 2, scale ) # scale here convert data to z-scores(standard-normal scare : subtract the mean and devided by the standard deviation so everything is centered at zero)
+
+```
+
+## Perform Cluster Analysis
+```{r}
+set.seed( 1234 )
+fit <- Mclust( d3 )
+msp_dorling$cluster <- as.factor( fit$classification )
+summary( fit )
+
+```
+
+### Identifying Neighborhood Clusters
+
+```{r, echo=TRUE, eval=TRUE, warning=FALSE}
+
+data.dictionary <- 
+structure( 
+  list( 
+    LABEL = c( "pnhwht12", "pnhblk12", "phisp12", 
+               "pntv12", "pfb12", "polang12", "phs12", "pcol12", "punemp12", 
+               "pflabf12", "pprof12", "pmanuf12", "pvet12", "psemp12", "hinc12", 
+               "incpc12", "ppov12", "pown12", "pvac12", "pmulti12", "mrent12", 
+               "mhmval12", "p30old12", "p10yrs12", "p18und12", 
+               "p60up12", "p75up12", "pmar12", "pwds12", "pfhh12" ), 
+    VARIABLE = c("Percent white, non-Hispanic", 
+                 "Percent black, non-Hispanic", "Percent Hispanic", 
+                 "Percent Native American race", "Percent foreign born", 
+                 "Percent speaking other language at home, age 5 plus", 
+                 "Percent with high school degree or less", 
+                 "Percent with 4-year college degree or more", 
+                 "Percent unemployed", "Percent female labor force participation", 
+                 "Percent professional employees", 
+                 "Percent manufacturing employees", 
+                 "Percent veteran", "Percent self-employed", 
+                 "Median HH income, total", "Per capita income", 
+                 "Percent in poverty, total", "Percent owner-occupied units", 
+                 "Percent vacant units", "Percent multi-family units", 
+                 "Median rent", "Median home value", 
+                 "Percent structures more than 30 years old",
+                 "Percent HH in neighborhood 10 years or less", 
+                 "Percent 17 and under, total", "Percent 60 and older, total",
+                 "Percent 75 and older, total", 
+                 "Percent currently married, not separated", 
+                 "Percent widowed, divorced and separated", 
+                 "Percent female-headed families with children" ) ), 
+  class = "data.frame", row.names = c( NA, -30L ) )
+
+```
+
+##Identifying Neighborhood Clusters
+```{r}
+df.pct <- sapply( d2, ntile, 100 )
+d4 <- as.data.frame( df.pct )
+d4$cluster <- as.factor( paste0("GROUP-",fit$classification) )
+
+num.groups <- length( unique( fit$classification ) )
+
+stats <- 
+d4 %>% 
+  group_by( cluster ) %>% 
+  summarise_each( funs(mean) )
+
+t <- data.frame( t(stats), stringsAsFactors=F )
+names(t) <- paste0( "GROUP.", 1:num.groups )
+t <- t[-1,]
+
+
+
+for( i in 1:num.groups )
+{
+  z <- t[,i]
+  plot( rep(1,30), 1:30, bty="n", xlim=c(-75,100), 
+        type="n", xaxt="n", yaxt="n",
+        xlab="Percentile", ylab="",
+        main=paste("GROUP",i) )
+  abline( v=seq(0,100,25), lty=3, lwd=1.5, col="gray90" )
+  segments( y0=1:30, x0=0, x1=100, col="gray70", lwd=2 )
+  text( -0.2, 1:30, data.dictionary$VARIABLE[-1], cex=0.6, pos=2 )
+  points( z, 1:30, pch=19, col="firebrick", cex=1.5 )
+  axis( side=1, at=c(0,50,100), col.axis="gray", col="gray" )
+}
+```
+
+```{r}
+#original data ranges
+summary(d2[ , 1:3])
+```
+
+```{r}
+# normalized data ranges
+# d3 <- apply(d2, 2, scale)
+summary(d3[ , 1:3])
+```
+
+##In order to add variables together we need to make sure positve scores represent high scores or vise versa and Use correlation structure to make sure we have all positive correlation
+
+```{r}
+#Variable Selection for Clustering
+d3 <- as.data.frame(d3)
+
+df.dim1 <- dplyr::select( d3, pown12, pmulti12, p10yrs12, pwds12, pfhh12 )
+
+corrplot( cor(df.dim1, use="complete.obs"), 
+          order = "hclust", tl.col='black', tl.cex=.75 ) 
+```
+## Chart above shows home ownership goes in the opposite direction as all other variables. Flip the signs of other variables so high is good on the scale.
+```{r}
+# flip the signs 
+df.dim1$pmulti12  <-  - df.dim1$pmulti12
+df.dim1$p10yrs12  <-  - df.dim1$p10yrs12
+df.dim1$pwds12    <-  - df.dim1$pwds12
+df.dim1$pfhh12    <-  - df.dim1$pfhh12
+
+corrplot( cor(df.dim1, use="complete.obs"), 
+          order = "hclust", tl.col='black', tl.cex=.75 ) 
+```
+
+## Diversity Index (Flip percent white - low proportion of white population corresponds with high levels of diversity)
+
+```{r}
+df.dim2 <- d3[ c("pnhwht12", "pnhblk12", "phisp12", "pfb12", "polang12") ]
+
+# Check direction
+# Need to flip percent white 
+df.dim2$pnhwht12<- -df.dim2$pnhwht12
+
+
+corrplot( cor(df.dim2, use="complete.obs"), 
+          order = "hclust", tl.col='black', tl.cex=.75 ) 
+```
+
+##Human Capital 
+```{r}
+df.dim3 <- select( d3, pcol12, phs12, pprof12, hinc12, mhmval12 )
+
+# Check direction
+# Need to flip high school graduation rates 
+df.dim3$hinc12 <- -df.dim3$hinc12
+
+corrplot( cor(df.dim3, use="complete.obs"), 
+          order = "hclust", tl.col='black', tl.cex=.75 ) 
+```
+
+
+## Construct the new indices
+```{r}
+dim1 <- d3$pown12 - d3$pmulti12 - d3$p10yrs12 - d3$pwds12 - d3$pfhh12
+dim2 <- - d3$pnhwht12 + d3$pnhblk12 + d3$phisp12 + d3$pfb12 + d3$polang12
+dim3 <- d3$pcol12 - d3$phs12 + d3$pprof12 + d3$hinc12 + d3$mhmval12
+
+df.nhood.metrics <- data.frame( dim1, dim2, dim3 )
+summary( df.nhood.metrics )
+```
+
+```{r}
+corrplot( cor( df.nhood.metrics, use="complete.obs" ), 
+          order = "hclust", tl.col='black', tl.cex=.75 ) 
+```
+
+
+## Come back here and pick your variables from census to compare
+```{r}
+fit2 <- Mclust( df.nhood.metrics )
+summary( fit2 )
+msp_dorling$cluster2 <- as.factor( fit2$classification )
+
+# cluster with dataset of three census variables 
+d33 <- data.frame( d3$p18und12, d3$pflabf12, d3$hinc12 )
+fit3 <- Mclust( d33 )
+summary( fit3 )
+
+msp_dorling$cluster3 <- as.factor( fit3$classification )
+
+
+
+tmap_mode("plot")
+tmap_style("cobalt")
+
+tm1 <- 
+tm_shape( msp_dorling, bbox=bb ) + 
+  tm_polygons( col="cluster", palette="Accent"  )
+
+tm2 <- 
+tm_shape( msp_dorling, bbox=bb ) + 
+  tm_polygons( col="cluster2", palette="Accent"  )
+
+tm3 <- 
+tm_shape( msp_dorling, bbox=bb ) + 
+  tm_polygons( col="cluster3", palette="Accent"  )
+
+
+tmap_arrange( tm1, tm2, tm3 )
+```
+
+```{r}
+# only 3 neighborhood indices
+plot( fit2, what = "classification" )
+```
+
+```{r}
+# only 3 census variables 
+plot( fit3, what = "classification" )
+```
+
+
+##Community Change
+
+```{r}
+URL1 <- "https://github.com/DS4PS/cpp-529-fall-2020/raw/main/LABS/data/rodeo/LTDB-2000.rds"
+ltdb00 <- readRDS( gzcon( url( URL1 ) ) )
+
+URL2 <- "https://github.com/DS4PS/cpp-529-fall-2020/raw/main/LABS/data/rodeo/LTDB-2010.rds"
+ltdb10 <- readRDS( gzcon( url( URL2 ) ) )
+
+URLmd <- "https://github.com/DS4PS/cpp-529-fall-2020/raw/main/LABS/data/rodeo/LTDB-META-DATA.rds"
+md <- readRDS( gzcon( url( URLmd ) ) )
+
+ltdb00 <- select( ltdb00, - year )
+ltdb10 <- select( ltdb10, - year )
+
+d <- merge( ltdb00, ltdb10, by="tractid" )
+d <- merge( d, md, by="tractid" )
+```
+
+
+```{r}
+#d <- filter( d, urban == "urban" )
+#Select Merced as the city. State level for Merced is 06 and county level is 047. 
+d_Mer <- d[grep("^fips-06-047", d$tractid),]
+# Remove .x on the end of all colume names
+colnames(d_Mer) <- gsub("\\.x$", "", colnames(d_Mer))
+
+```
+
+```{r}
+## Select variables from data set d and create percentage variables
+d <- select( d_Mer, tractid, 
+             mhmval00, mhmval12, 
+             hinc00, 
+             hu00, vac00, own00, rent00, h30old00,
+             empclf00, clf00, unemp00, prof00,  
+             dpov00, npov00,
+             ag25up00, hs00, col00, 
+             pop00, nhwht00, nhblk00, hisp00, asian00,
+             cbsa, cbsaname )
+
+ 
+d <- 
+  d_Mer %>%
+  mutate( # percent white in 2000
+          p.white = 100 * nhwht00 / pop00,
+          # percent black in 2000
+          p.black = 100 * nhblk00 / pop00,
+          # percent hispanic in 2000
+          p.hisp = 100 * hisp00 / pop00, 
+          # percent asian in 2000
+          p.asian = 100 * asian00 / pop00,
+          # percent high school grads by age 25 in 2000 
+          p.hs = 100 * (hs00+col00) / ag25up00,
+          # percent pop with college degree in 2000
+          p.col = 100 * col00 / ag25up00,
+          # percent employed in professional fields in 2000
+          p.prof = 100 * prof00 / empclf00,
+          # percent unemployment  in 2000
+          p.unemp = 100 * unemp00 / clf00,
+          # percent of housing lots in tract that are vacant in 2000
+          p.vacant = 100 * vac00 / hu00,
+          # dollar change in median home value 2000 to 2010 
+          pov.rate = 100 * npov00 / dpov00 )
+
+
+# adjust 2000 home values for inflation 
+mhv.00 <- d$mhmval00 * 1.28855  
+mhv.10 <- d$mhmval12
+
+# change in MHV in dollars
+mhv.change <- mhv.10 - mhv.00
+
+
+# drop low 2000 median home values
+# to avoid unrealistic growth rates.
+#
+# tracts with homes that cost less than
+# $1,000 are outliers
+mhv.00[ mhv.00 < 1000 ] <- NA
+
+
+# change in MHV in percent
+mhv.growth <- 100 * ( mhv.change / mhv.00 )
+mhv.growth [mhv.growth>200] <- NA
+
+d$mhv.00 <- mhv.00
+d$mhv.10 <- mhv.10
+d$mhv.change <- mhv.change
+d$mhv.growth <- mhv.growth 
+
+
+```
+```{r}
+median(d_Mer$mhv.00)
+```
+
+##Median Home Value
+```{r}
+hist( mhv.00, breaks=50, xlim=c(0,300000), 
+      col="darkblue", border="white",
+      axes=F, 
+      xlab="MHV (median = $127k)",
+      ylab="",
+      main="Merced Median Home Value in 2000 (2010 US dollars)" )
+
+axis( side=1, at=seq(0,300000,100000), 
+      labels=c("$0","$100k","$200k","$300k") )
+median.x <- median( d_Mer$mhv.00/1000, na.rm=T )
+abline( v=median( mhv.00, na.rm=T ), col="orange", lwd=3 )
+text( x=100, y=200, 
+      labels=paste0( "Median = ", dollar( round(1000*median.x,0)) ), 
+      col="orange", cex=1.8, pos=3 )
+```
+
+```{r}
+df <- data.frame( MedianHomeValue2000=mhv.00, 
+                  MedianHomeValue2010=mhv.10, 
+                  MHV.Change.00.to.10=mhv.change )
+
+stargazer( df, 
+           type=s.type, 
+           digits=0, 
+           summary.stat = c("min", "p25","median","mean","p75","max") )
+```
+
+
+
+```{r}
+hist( mhv.change/1000, breaks=50, 
+      xlim=c(-100,300), yaxt="n", xaxt="n",
+      xlab="Thousand of US Dollars (adjusted to 2010)", cex.lab=1.5,
+      ylab="", main="Merced Change in Median Home Value 2000 to 2010",
+      col="darkblue", border="white" )
+
+axis( side=1, at=seq( from=-100, to=300, by=100 ), 
+      labels=paste0( "$", seq( from=-100, to=300, by=100 ), "k" ) )
+        
+mean.x <- mean( d_Mer$mhv.change/1000, na.rm=T )
+abline( v=mean.x, col="darkorange", lwd=2, lty=2 )
+text( x=200, y=1.5, 
+      labels=paste0( "Mean = ", dollar( round(1000*mean.x,0)) ), 
+      col="darkorange", cex=1.8, pos=3 )
+
+median.x <- median( d_Mer$mhv.change/1000, na.rm=T )
+abline( v=median.x, col="dodgerblue", lwd=2, lty=2 )
+text( x=200, y=3, 
+      labels=paste0( "Median = ", dollar( round(1000*median.x,0)) ), 
+      col="dodgerblue", cex=1.8, pos=3 )
+```
+
+```{r}
+# % CHANGE
+hg <-
+hist( mhv.growth, breaks=50, 
+      xlim=c(-100,200), yaxt="n", xaxt="n",
+      xlab="", cex.main=1.5,
+      ylab="", main="Growth in Home Value by Census Tract 2000 to 2010",
+      col="gray40", border="white" )
+
+axis( side=1, at=seq( from=-100, to=200, by=50 ), 
+      labels=paste0( seq( from=-100, to=200, by=50 ), "%" ) )
+
+ymax <- max( hg$count )
+        
+mean.x <- mean( mhv.growth, na.rm=T )
+abline( v=mean.x, col="darkorange", lwd=2, lty=2 )
+text( x=100, y=(0.5*ymax), 
+      labels=paste0( "Mean = ", round(mean.x,0), "%"), 
+      col="darkorange", cex=1.8, pos=4 )
+
+median.x <- median( mhv.growth, na.rm=T )
+abline( v=median.x, col="dodgerblue", lwd=2, lty=2 )
+text( x=100, y=(0.6*ymax), 
+      labels=paste0( "Median = ", round(median.x,0), "%"), 
+      col="dodgerblue", cex=1.8, pos=4 )
+```
+```{r}
+# average growth in median home value for the city
+d_Mer<- 
+  d_Mer %>%
+  group_by( cbsaname ) %>%
+  mutate( metro.mhv.change = median( mhv.change, na.rm=T ),
+             metro.mhv.growth = 100 * median( mhv.growth, na.rm=T ) ) %>%
+  ungroup() 
+```
+
+
+##Part 01: Var unemployment% : Higher levels of unemployment in 2000 will predit a large decrese in home value between 2000 and 2010. 
+```{r}
+# Choose three variables 
+set.seed( 1234 )
+d2 <- select( d_Mer, mhv.growth, p.col, hu00, hinc00, p.unemp)
+# recode some vars to remove outliers and skew
+d2$mhv.growth[ d2$mhv.growth > 200 ] <- NA
+
+d2$p.col <- log10( d2$p.col + 1 )
+d2$p.unemp <- log10( d2$p.unemp + 1)
+d4 <- sample_n( d2, 49 ) %>% na.omit()
+
+panel.cor <- function(x, y, digits=2, prefix="", cex.cor)
+{
+  usr <- par("usr"); on.exit(par(usr))
+  par(usr = c(0, 1, 0, 1))
+  r <- abs(cor(x, y))
+  txt <- format(c(r, 0.123456789), digits=digits)[1]
+  txt <- paste(prefix, txt, sep="")
+  if(missing(cex.cor)) cex <- 0.8/strwidth(txt)
+  
+  test <- cor.test(x,y)
+  # borrowed from printCoefmat
+  Signif <- symnum(test$p.value, corr = FALSE, na = FALSE,
+                   cutpoints = c(0, 0.001, 0.01, 0.05, 0.1, 1),
+                   symbols = c("***", "**", "*", ".", " "))
+  
+  text(0.5, 0.5, txt, cex = 1.5 )
+  text(.7, .8, Signif, cex=cex, col=2)
+}
+pairs( d4, upper.panel=panel.cor, lower.panel=panel.smooth )
+```
+
+##Part 02: I dont think there is variable skew in the data set. 
+
+##Part 03: Multicollinearity means there are variables that are highly correlated which can cancel eachother out. 
+```{r}
+reg.data <- d2
+reg.data$mhv.growth[ reg.data$mhv.growth > 200 ] <- NA
+d2$p.col <- log10( d2$p.col + 1 )
+d2$p.unemp <- log10( d2$p.unemp + 1 )
+m1 <- lm( mhv.growth ~  p.col, data=reg.data )
+m2 <- lm( mhv.growth ~  hu00, data=reg.data )
+m3 <- lm( mhv.growth ~  hinc00, data=reg.data )
+m4 <- lm( mhv.growth ~  p.unemp, data=reg.data )
+m5 <- lm( mhv.growth ~  p.col + hu00 + hinc00 + p.unemp, data=reg.data )
+stargazer( m1, m2, m3, m4, m5,
+           type="text", digits=2,
+           omit.stat = c("rsq","f") )
+```
+
+##Part 04: I think they are all Linear relationship
+```{r}
+jplot <- function( x1, x2, lab1="", lab2="", draw.line=T, ... )
+{
+
+    plot( x1, x2,
+          pch=19, 
+          col=gray(0.6, alpha = 0.2), 
+          cex=0.5,  
+          bty = "n",
+          xlab=lab1, 
+          ylab=lab2, cex.lab=1.5,
+        ... )
+
+    if( draw.line==T ){ 
+        ok <- is.finite(x1) & is.finite(x2)
+        lines( lowess(x2[ok]~x1[ok]), col="red", lwd=3 ) }
+
+}
+```
+
+```{r}
+jplot(d_Mer$p.col, d_Mer$mhv.growth, lab1="% College Degree ", lab2="Growth" )
+jplot(d_Mer$p.unemp, d_Mer$mhv.growth, lab1="% Unemployment ", lab2="Growth" )
+jplot(d_Mer$hu00, d_Mer$mhv.growth, lab1="Housing Units", lab2="Growth" )
+jplot(d_Mer$hinc00, d_Mer$mhv.growth, lab1="Household Income", lab2="Growth" )
+```
+
+
+##Part 04: Descriptives
+## 1. The typical change from 2000 to 2010 is $8651. The largest change in home value is $183,349
+## 2. The correlation of those two variables is very high which equals to 0.97. I dont think they measure the same thing. 
+```{r}
+d_des <- data.frame(df,d2)
+
+stargazer( d_des, 
+           type=s.type, 
+           digits=0, 
+           summary.stat = c("min", "p25","median","mean","p75","max") )
+```
+
+```{r}
+reg.change <- d2
+reg.change$mhv.growth[ reg.data$mhv.growth > 200 ] <- NA
+m1 <- lm( mhv.growth ~ mhv.change, data=reg.data )
+stargazer( m1,
+           type="text", digits=2,
+           omit.stat = c("rsq","f") )
+
+
+jplot(d_Mer$mhv.change, d_Mer$mhv.growth, lab1="Median Home Value Change", lab2="Median Home Value Growth" )
+
+correlation <- cor(d_Mer$mhv.change, d_Mer$mhv.growth)
+correlation
+
+```
+
+##Part 05 - Models
+## 1. Only Hinc00 the house hold income is statistically significant. But those numbers seem very wrong. 
+## 2. The unemployment has a statistically significant impact on home growth. But still the number seems too big to be right. ## 3. The results didnt match my predictions. It is very off and I dont know where went wrong. 
+```{r}
+reg.data <- d_des
+reg.data$mhv.growth[ reg.data$mhv.growth > 200 ] <- NA
+d_des$p.col <- log10( d_des$p.col + 1 )
+d_des$p.unemp <- log10( d_des$p.unemp + 1 )
+m1 <- lm( MedianHomeValue2000 ~  p.col + p.unemp + hu00 + hinc00, data=reg.data )
+m2 <- lm( mhv.growth ~  p.col + p.unemp + hu00 + hinc00, data=reg.data )
+stargazer( m1, m2,
+           type="text", digits=2,
+           omit.stat = c("rsq","f") )
+```
+
+##Part 06 - Effect Sizes
+## I think the coefficient sizes are already calculated in question 5. 
+
+##MAPS
+```{r}
+# geoid-01 is the hypothetical name of tract ID in the shapefile
+# geoid-02 is the hypothetical name of tract ID in the census dataset
+
+# dorling must be an sp shapefile 
+crosswalk <- read.csv( "https://raw.githubusercontent.com/DS4PS/cpp-529-master/master/data/cbsatocountycrosswalk.csv",  stringsAsFactors=F, colClasses="character" )
+
+# search for citie names by strings, use the ^ anchor for "begins with" 
+
+grep( "^MER", crosswalk$msaname, value=TRUE ) 
+these.msp <- crosswalk$msaname == "MERCED, CA"
+these.fips <- crosswalk$fipscounty[ these.msp ]
+these.fips <- na.omit( these.fips )
+
+head( these.fips ) %>% pander()
+state.fips <- substr( these.fips, 1, 2 )
+county.fips <- substr( these.fips, 3, 5 )
+
+cbind( these.fips, state.fips, county.fips ) %>% pander()
+
+merced.pop <-
+get_acs( geography = "tract", variables = "B01003_001",
+         state = "06", county = county.fips[state.fips=="06"], geometry = TRUE ) %>% 
+         select( GEOID, estimate )
+
+URL <- "https://github.com/DS4PS/cpp-529-master/raw/master/data/ltdb_std_2010_sample.rds"
+census.dat <- readRDS(gzcon(url( URL )))
+
+merced.pop$GEOID<-sub( ".","", merced.pop$GEOID ) #Remove first 0 on GEOID to match trackid in Census_dat
+d_Mer$tractid <- sub("fips-", "", d_Mer$tractid)# Remove fips 
+d_Mer$tractid <- sub("^0", "", d_Mer$tractid)   # Remove the first 0
+d_Mer$tractid <- gsub("-", "", d_Mer$tractid)   # Remove all - 
+
+# Merge data sets by tractid
+msp <- merge( d_Mer, merced.pop, by.x="tractid", by.y="GEOID" )
+msp <- merge( msp, census.dat, by.x= "tractid", by.y="tractid")
+
+```
+
+```{r}
+#Since msp is a data frame, need to use st_as_sf convert it to sf object first.
+msp <- st_as_sf(msp)
+# make sure there are no empty polygons
+msp <- msp[ ! st_is_empty( msp ) , ]
+# convert sf map object to an sp version
+msp.sp <- as_Spatial( msp )
+
+class( msp.sp )
+# project map and remove empty tracts
+msp.sp <- spTransform( msp.sp, CRS("+init=epsg:3395"))
+msp.sp <- msp.sp[ msp.sp$estimate != 0 & (! is.na( msp.sp$estimate )) , ]
+
+# convert census tract polygons to dorling cartogram
+# no idea why k=0.03 works, but it does - default is k=5
+msp.sp$pop.w <- msp.sp$estimate / 9000 # max(msp.sp$POP)   # standardizes it to max of 1.5
+msp_dorling <- cartogram_dorling( x=msp.sp, weight="pop.w", k=0.05 )
+plot( msp_dorling )
+
+```
+
+```{r}
+hist(log(msp$mhmval00 + 1),breaks = 100, main = "Median Home Value in 2000")
+hist(log(msp$mhmval12.x + 1), breaks = 100, col = "darkgray", main = "Median Home Value in 2010")
+hist(log(msp$mhv.change + 1), breaks = 100, col = "darkgray", main = "Change in home values 2000-2010")
+
+
+
+```
+
+
+```{r}
+library( pals)         # color scales
+ggplot(msp) +
+    geom_sf(aes(fill = mhmval00), color=NA) +
+    coord_sf( datum=NA ) +
+    labs( title = "Median Home Values in 2000",
+          caption = "Source: ACS 5-year, 2013-2017",
+          fill = "Home Values" ) +
+    scale_fill_gradientn( colours=ocean.balance(10), guide = "colourbar" )
+
+ggplot(msp) +
+    geom_sf(aes(fill = mhmval12.x), color=NA) +
+    coord_sf( datum=NA ) +
+    labs( title = "Median Home Values in 2010",
+          caption = "Source: ACS 5-year, 2013-2017",
+          fill = "Home Values" ) +
+    scale_fill_gradientn( colours=ocean.balance(10), guide = "colourbar" )
+
+ggplot(msp) +
+    geom_sf(aes(fill = mhv.change), color=NA) +
+    coord_sf( datum=NA ) +
+    labs( title = "Change in Median Home Values 2000 - 2010",
+          caption = "Source: ACS 5-year, 2013-2017",
+          fill = "Home Values Change" ) +
+    scale_fill_gradientn( colours=ocean.balance(10), guide = "colourbar" )
+```
+
+```{r}
+##LOGGED RATIO
+log.mhmval00<- log(msp$mhmval00 + 1)
+log.mhmval12<- log(msp$mhmval12 + 1)
+log.mhv.change<- log(msp$mhv.change + 1)
+
+ggplot(msp) +
+    geom_sf(aes(fill = log.mhmval00), color=NA) +
+    coord_sf( datum=NA ) +
+    labs( title = "Median Home Values in 2000",
+          caption = "Source: ACS 5-year, 2013-2017",
+          fill = "Home Values" ) +
+    scale_fill_gradientn( colours=ocean.balance(10), guide = "colourbar" )
+```
